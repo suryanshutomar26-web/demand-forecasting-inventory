@@ -6,8 +6,17 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# Support running Streamlit from either the project root
+# or the app directory.
+try:
+    from inventory import calculate_inventory_metrics
+except ModuleNotFoundError:
+    from app.inventory import calculate_inventory_metrics
 
 
+# --------------------------------------------------
+# 1. Page configuration
+# --------------------------------------------------
 
 st.set_page_config(
     page_title="Demand Forecasting & Inventory Optimization",
@@ -18,56 +27,96 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 
+LEAD_TIME_DAYS = 7
+REVIEW_PERIOD_DAYS = 7
+PROTECTION_DAYS = LEAD_TIME_DAYS + REVIEW_PERIOD_DAYS
 
 
+# --------------------------------------------------
+# 2. Load the exported demo data
+# --------------------------------------------------
 
 @st.cache_data
 def load_data():
     history = pd.read_csv(DATA_DIR / "historical_sales.csv")
     forecasts = pd.read_csv(DATA_DIR / "future_forecasts.csv")
-    safety_stock = pd.read_csv(DATA_DIR / "safety_stock.csv")
+    safety = pd.read_csv(DATA_DIR / "safety_stock.csv")
 
-    history["date"] = pd.to_datetime(history["date"])
-    forecasts["date"] = pd.to_datetime(forecasts["date"])
+    required_history = {"date", "item_id", "store_id", "sales"}
+    required_forecasts = {
+        "date", "item_id", "store_id", "forecast_demand"
+    }
+    required_safety = {
+        "item_id",
+        "lead_time_safety_stock",
+        "protection_safety_stock",
+    }
 
-    history["sales"] = pd.to_numeric(history["sales"])
+    if not required_history.issubset(history.columns):
+        raise ValueError("Historical sales file has missing columns.")
+
+    if not required_forecasts.issubset(forecasts.columns):
+        raise ValueError("Forecast file has missing columns.")
+
+    if not required_safety.issubset(safety.columns):
+        raise ValueError("Safety-stock file has missing columns.")
+
+    history["date"] = pd.to_datetime(history["date"], errors="raise")
+    forecasts["date"] = pd.to_datetime(forecasts["date"], errors="raise")
+
+    history["sales"] = pd.to_numeric(
+        history["sales"], errors="raise"
+    )
     forecasts["forecast_demand"] = pd.to_numeric(
-        forecasts["forecast_demand"]
+        forecasts["forecast_demand"], errors="raise"
     )
 
-    return history, forecasts, safety_stock
+    if (
+        not np.isfinite(history["sales"]).all()
+        or (history["sales"] < 0).any()
+    ):
+        raise ValueError("Historical sales contain invalid values.")
+
+    if (
+        not np.isfinite(forecasts["forecast_demand"]).all()
+        or (forecasts["forecast_demand"] < 0).any()
+    ):
+        raise ValueError("Forecast data contains invalid values.")
+
+    return history, forecasts, safety
 
 
 try:
-    history, forecasts, safety_stock = load_data()
-except (FileNotFoundError, pd.errors.EmptyDataError) as error:
-    st.error(
-        "Dashboard data is missing. Run the export cell in "
-        "09_inventory_optimization.ipynb first."
-    )
-    st.exception(error)
+    history, forecasts, safety = load_data()
+except (FileNotFoundError, ValueError, pd.errors.ParserError) as error:
+    st.error(f"Could not load dashboard data: {error}")
     st.stop()
 
 
+# --------------------------------------------------
+# 3. Header
+# --------------------------------------------------
 
 st.title("📦 Demand Forecasting & Inventory Optimization")
 
 st.write(
-    "Explore retail demand forecasts and translate them into "
+    "Forecast retail demand and translate forecasts into "
     "inventory replenishment recommendations."
 )
 
 last_history_date = history["date"].max()
 
 st.info(
-    f"Demo dataset: historical sales end on "
-    f"{last_history_date:%d %b %Y}. Forecasts cover the next "
-    "14 days after that date, not live demand in 2026. "
-    "Inventory inputs are illustrative and can be changed below."
+    f"This demonstration uses historical M5 data ending "
+    f"{last_history_date:%d %B %Y}. Forecasts are based on this "
+    "historical dataset, not live retail demand. Inventory levels "
+    "are illustrative."
 )
 
 
-
+# --------------------------------------------------
+# 4. Sidebar controls
+# --------------------------------------------------
 
 st.sidebar.header("Dashboard Controls")
 
@@ -93,6 +142,7 @@ on_hand = st.sidebar.number_input(
     min_value=0,
     value=default_stock.get(selected_item, 0),
     step=1,
+    key=f"on_hand_{selected_item}",
 )
 
 on_order = st.sidebar.number_input(
@@ -100,6 +150,7 @@ on_order = st.sidebar.number_input(
     min_value=0,
     value=0,
     step=1,
+    key=f"on_order_{selected_item}",
 )
 
 backorders = st.sidebar.number_input(
@@ -107,15 +158,13 @@ backorders = st.sidebar.number_input(
     min_value=0,
     value=0,
     step=1,
+    key=f"backorders_{selected_item}",
 )
 
 
-lead_time_days = 7
-review_period_days = 7
-protection_days = lead_time_days + review_period_days
-
-
-
+# --------------------------------------------------
+# 5. Select data for the chosen product
+# --------------------------------------------------
 
 product_history = (
     history[history["item_id"] == selected_item]
@@ -129,16 +178,21 @@ product_forecasts = (
     .copy()
 )
 
-safety_row = safety_stock[
-    safety_stock["item_id"] == selected_item
-]
+safety_row = safety[safety["item_id"] == selected_item]
 
-if product_forecasts.empty or safety_row.empty:
-    st.error("Forecast or safety-stock data is unavailable for this product.")
+if product_history.empty:
+    st.error("Historical data is unavailable for this product.")
     st.stop()
 
-if len(product_forecasts) < protection_days:
-    st.error("Insufficient forecast days for the inventory policy.")
+if product_forecasts.empty or safety_row.empty:
+    st.error("Forecast or safety-stock data is unavailable.")
+    st.stop()
+
+if len(product_forecasts) < PROTECTION_DAYS:
+    st.error(
+        f"At least {PROTECTION_DAYS} forecast days are needed "
+        "for the current inventory policy."
+    )
     st.stop()
 
 safety_row = safety_row.iloc[0]
@@ -148,51 +202,63 @@ lead_time_safety_stock = max(
     float(safety_row["lead_time_safety_stock"]),
 )
 
-protection_safety_stock = max(
+protection_period_safety_stock = max(
     0.0,
     float(safety_row["protection_safety_stock"]),
 )
 
 
-
-
-inventory_position = on_hand + on_order - backorders
+# --------------------------------------------------
+# 6. Forecast demand over the required periods
+# --------------------------------------------------
 
 lead_time_demand = float(
-    product_forecasts.head(lead_time_days)["forecast_demand"].sum()
+    product_forecasts.head(LEAD_TIME_DAYS)["forecast_demand"].sum()
 )
 
 protection_period_demand = float(
-    product_forecasts.head(protection_days)["forecast_demand"].sum()
-)
-
-reorder_point = lead_time_demand + lead_time_safety_stock
-
-target_stock_level = (
-    protection_period_demand + protection_safety_stock
-)
-
-recommended_order_qty = int(
-    np.ceil(
-        max(0.0, target_stock_level - inventory_position)
-    )
+    product_forecasts.head(PROTECTION_DAYS)["forecast_demand"].sum()
 )
 
 
+# --------------------------------------------------
+# 7. Use the tested inventory calculation function
+# --------------------------------------------------
 
+inventory_metrics = calculate_inventory_metrics(
+    on_hand_units=on_hand,
+    on_order_units=on_order,
+    backorders=backorders,
+    lead_time_demand=lead_time_demand,
+    protection_period_demand=protection_period_demand,
+    lead_time_safety_stock=lead_time_safety_stock,
+    protection_period_safety_stock=protection_period_safety_stock,
+)
+
+inventory_position = inventory_metrics["inventory_position"]
+reorder_point = inventory_metrics["reorder_point"]
+target_stock_level = inventory_metrics["target_stock_level"]
+recommended_order_qty = inventory_metrics["recommended_order_qty"]
+below_reorder_point = inventory_metrics["below_reorder_point"]
+reorder_status = inventory_metrics["reorder_status"]
+
+
+# --------------------------------------------------
+# 8. Inventory KPIs
+# --------------------------------------------------
 
 st.subheader(f"Product overview: {selected_item}")
 
 col1, col2, col3, col4 = st.columns(4)
 
 col1.metric(
-    "Forecast demand · 14 days",
+    "14-day forecast",
     f"{protection_period_demand:.1f} units",
 )
 
 col2.metric(
     "Inventory position",
-    f"{inventory_position} units",
+    f"{inventory_position:.1f} units",
 )
 
 col3.metric(
@@ -206,27 +272,30 @@ col4.metric(
 )
 
 
-
+# --------------------------------------------------
+# 9. Replenishment recommendation
+# --------------------------------------------------
 
 st.subheader("Inventory recommendation")
 
-if inventory_position <= reorder_point:
+if below_reorder_point:
     st.warning(
         "Inventory position is at or below the reorder point."
     )
 elif recommended_order_qty > 0:
     st.info(
-        "Inventory is above the reorder point, but the periodic-review "
-        "policy recommends an order to reach the target stock level."
+        "An order is recommended to reach the target stock level, "
+        "even though inventory is above the reorder point."
     )
 else:
     st.success(
         "No replenishment is required under the current inventory policy."
     )
 
-summary_col1, summary_col2 = st.columns(2)
+left, right = st.columns(2)
 
-with summary_col1:
+with left:
+    st.write(f"**Status:** {reorder_status}")
     st.write(f"**Lead-time demand:** {lead_time_demand:.2f} units")
     st.write(
         f"**Lead-time safety stock:** "
@@ -234,25 +303,31 @@ with summary_col1:
     )
     st.write(f"**Reorder point:** {reorder_point:.2f} units")
 
-with summary_col2:
+with right:
     st.write(
-        f"**Demand over {protection_days} days:** "
+        f"**Protection-period demand:** "
         f"{protection_period_demand:.2f} units"
     )
     st.write(
         f"**Protection-period safety stock:** "
-        f"{protection_safety_stock:.2f} units"
+        f"{protection_period_safety_stock:.2f} units"
     )
     st.write(f"**Target stock level:** {target_stock_level:.2f} units")
+    st.write(
+        f"**Inventory position:** {inventory_position:.2f} units"
+    )
 
 st.caption(
     "Inventory position = on-hand + on-order − backorders. "
-    "The recommended order raises inventory position toward the "
-    "target stock level. Quantities assume no additional constraints "
-    "such as minimum order sizes, pack sizes, or warehouse capacity."
+    "The policy assumes a 7-day supplier lead time and a 7-day "
+    "review period. Safety-stock estimates are preliminary and "
+    "are not guaranteed service-level outcomes."
 )
 
 
+# --------------------------------------------------
+# 10. Historical sales and demand forecast chart
+# --------------------------------------------------
 
 st.subheader("Historical demand and forecast")
 
@@ -289,7 +364,9 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 
-
+# --------------------------------------------------
+# 11. Forecast table and CSV download
+# --------------------------------------------------
 
 st.subheader("14-day demand forecast")
 
@@ -322,28 +399,34 @@ st.download_button(
 )
 
 
+# --------------------------------------------------
+# 12. Explain how the inventory policy works
+# --------------------------------------------------
 
-
-with st.expander("How are these inventory recommendations calculated?"):
+with st.expander("How are inventory recommendations calculated?"):
     st.markdown(
         """
         **Reorder point**
 
-        Expected demand over the supplier lead time plus estimated
-        lead-time safety stock.
+        Expected demand over the supplier lead time plus lead-time
+        safety stock.
 
         **Target stock level**
 
-        Forecast demand over the lead time plus the review period,
-        plus the estimated protection-period safety stock.
+        Expected demand over the lead time plus review period,
+        plus protection-period safety stock.
 
         **Recommended order quantity**
 
-        The target stock level minus inventory position, rounded up
-        to a whole unit and never allowed to become negative.
+        The non-negative difference between target stock level and
+        inventory position, rounded up to a whole unit.
 
-        Safety-stock estimates are historical approximations, not
-        guaranteed service-level outcomes. Lead time and review period
-        are fixed at seven days each in this first dashboard version.
+        **Limitations**
+
+        The current prototype uses illustrative inventory levels,
+        fixed lead and review periods, and preliminary safety-stock
+        estimates. It does not optimize purchase cost, minimum order
+        quantities, pack sizes, warehouse capacity, or changing
+        supplier lead times.
         """
     )
